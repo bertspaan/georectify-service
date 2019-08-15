@@ -6,6 +6,13 @@ const express = require('express')
 const app = express()
 const port = 8080
 
+const dataDir = process.argv[2]
+
+if (!dataDir || !fs.existsSync(dataDir)) {
+  console.error('Please supply a valid output directory as an command-line argument!')
+  process.exit(1)
+}
+
 const apiBaseUrl = 'https://commons.wikimedia.org/w/api.php'
 const mapDataUrl = (title) => `${apiBaseUrl}?action=query&format=json&prop=mapdata&titles=${encodeURIComponent(title)}`
 const imageInfoUrl = (title) => `${apiBaseUrl}?action=query&format=json&prop=imageinfo&titles=${encodeURIComponent(title)}&iiprop=size%7Curl`
@@ -40,8 +47,7 @@ async function downloadImage (url) {
 function gdalCommands (name, gcps) {
   const parsed = path.parse(name)
 
-  const script = `#!/bin/sh
-
+  const script = `
 gdal_translate -of vrt \\
   -a_srs EPSG:4326 \\
   ${gcps.map((gcp) => `-gcp ${gcp.join(' ')}`).join(' ')} \\
@@ -58,6 +64,12 @@ gdalwarp -co TILED=YES \\
 
   return script
 }
+
+app.get('/', async (req, res) => {
+  res.send({
+    status: 'running!'
+  })
+})
 
 app.get('/:title', async (req, res) => {
   const imageTitle = req.params.title
@@ -94,17 +106,17 @@ app.get('/:title', async (req, res) => {
 
   const script = gdalCommands(name, gcps)
 
-  fs.writeFileSync(`./../data/${name}`, image)
-  fs.writeFileSync(`./../data/${geojsonName}`, JSON.stringify(mask, null, 2))
-  fs.writeFileSync(`./../data/${scriptName}`, script)
+  fs.writeFileSync(path.join(dataDir, name), image)
+  fs.writeFileSync(path.join(dataDir, geojsonName), JSON.stringify(mask, null, 2))
+  fs.writeFileSync(path.join(dataDir, scriptName), script)
 
-  exec(`bash "./../data/${scriptName}"`, {
-    cwd: './../data'
+  exec(`bash "${path.join(dataDir, scriptName)}"`, {
+    cwd: dataDir
   }, (err, stdout, stderr) => {
     if (err) {
       res.status(500).send(stderr)
     } else {
-      const warpedFilename = `./../data/${parsed.name}-warped.tiff`
+      const warpedFilename = path.join(dataDir, `${parsed.name}-warped.tiff`)
       const stats = fs.statSync(warpedFilename)
 
       const geotiff = fs.readFileSync(warpedFilename)
