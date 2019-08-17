@@ -1,9 +1,8 @@
 const fs = require('fs')
 const path = require('path')
-const axios = require('axios')
-const exec = require('child_process').exec
 const express = require('express')
 const app = express()
+app.use(express.json())
 const port = 8080
 
 const dataDir = process.argv[2]
@@ -13,56 +12,16 @@ if (!dataDir || !fs.existsSync(dataDir)) {
   process.exit(1)
 }
 
-const apiBaseUrl = 'https://commons.wikimedia.org/w/api.php'
-const mapDataUrl = (title) => `${apiBaseUrl}?action=query&format=json&prop=mapdata&titles=${encodeURIComponent(title)}`
-const imageInfoUrl = (title) => `${apiBaseUrl}?action=query&format=json&prop=imageinfo&titles=${encodeURIComponent(title)}&iiprop=size%7Curl`
+const commons = require('./lib/commons')
+const json = require('./lib/json')
 
-const firstPageFromResponse = (response, key) => Object.values(response.data.query.pages)[0][key][0]
-
-async function getMapData (title) {
-  const parsed = path.parse(title)
-  const georefTitle = parsed.name.replace(/^File:/, 'Data:') + '.georef.map'
-
-  const response = await axios.get(mapDataUrl(georefTitle))
-  const mapDataString = firstPageFromResponse(response, 'mapdata')
-  const mapData = Object.values(JSON.parse(mapDataString))[0][0]
-
-  return mapData
-}
-
-async function getImageInfo (title) {
-  const response = await axios.get(imageInfoUrl(title))
-  const imageInfo = firstPageFromResponse(response, 'imageinfo')
-  return imageInfo
-}
-
-async function downloadImage (url) {
-  const response = await axios.get(url, {
-    responseType: 'arraybuffer'
+function sendTiff (res, tiff, filename) {
+  res.writeHead(200, {
+    'Content-Type': 'image/tiff',
+    'Content-disposition': `attachment;filename=${filename}`,
+    'Content-Length': tiff.length
   })
-
-  return response.data
-}
-
-function gdalCommands (name, gcps) {
-  const parsed = path.parse(name)
-
-  const script = `
-gdal_translate -of vrt \\
-  -a_srs EPSG:4326 \\
-  ${gcps.map((gcp) => `-gcp ${gcp.join(' ')}`).join(' ')} \\
-  "${name}" \\
-  "${parsed.name}.vrt"
-
-gdalwarp -co TILED=YES \\
-  -co COMPRESS=JPEG -co JPEG_QUALITY=80 \\
-  -dstalpha -overwrite \\
-  -cutline "${parsed.name}.geojson" -crop_to_cutline \\
-  -t_srs "EPSG:4326" \\
-  "${parsed.name}.vrt" \\
-  "${parsed.name}-warped.tiff"`
-
-  return script
+  res.end(tiff)
 }
 
 app.get('/', async (req, res) => {
@@ -71,64 +30,35 @@ app.get('/', async (req, res) => {
   })
 })
 
-app.get('/:title', async (req, res) => {
-  const imageTitle = req.params.title
+app.get('/commons/geojson', async (req, res) => {
+  const title = req.query.title
+  const rectification = await commons.getRectification(title)
+  res.send(rectification.geoMask)
+})
 
-  if (!imageTitle.startsWith('File:')) {
-    res.status(404).send('No!')
-    return
-  }
+app.get('/commons/geotiff', async (req, res) => {
+  const title = req.query.title
+  const rectification = await commons.getRectification(title)
+  const geotiff = await commons.warpImage(title, rectification, dataDir)
 
-  const mapData = await getMapData(imageTitle)
-  const imageInfo = await getImageInfo(imageTitle)
-
-  const image = await downloadImage(imageInfo.url)
-
-  const mask = mapData.features
-    .filter((feature) => feature.properties.type === 'mask')[0]
-    .geometry
-
-  const dimensions = [imageInfo.width, imageInfo.height]
-
-  const gcps = mapData.features
-    .filter((feature) => feature.properties.type === 'gcp')
-    .map((feature) => ([
-      feature.properties.pixel[0] * dimensions[0],
-      feature.properties.pixel[1] * dimensions[1],
-      feature.geometry.coordinates[0],
-      feature.geometry.coordinates[1]
-    ]))
-
-  const name = imageTitle.replace(/^File:/, '')
+  const name = title.replace(/^File:/, '')
   const parsed = path.parse(name)
-  const geojsonName = `${parsed.name}.geojson`
-  const scriptName = `${parsed.name}.sh`
 
-  const script = gdalCommands(name, gcps)
+  sendTiff(res, geotiff, `${parsed.name}-warped.tiff`)
+})
 
-  fs.writeFileSync(path.join(dataDir, name), image)
-  fs.writeFileSync(path.join(dataDir, geojsonName), JSON.stringify(mask, null, 2))
-  fs.writeFileSync(path.join(dataDir, scriptName), script)
+app.post('/json/geojson', async (req, res) => {
+  // TODO: check req.body against JSON Schema!!!!!!!1
 
-  exec(`bash "${path.join(dataDir, scriptName)}"`, {
-    cwd: dataDir
-  }, (err, stdout, stderr) => {
-    if (err) {
-      res.status(500).send(stderr)
-    } else {
-      const warpedFilename = path.join(dataDir, `${parsed.name}-warped.tiff`)
-      const stats = fs.statSync(warpedFilename)
+  const rectification = await json.getRectification(req.body)
+  res.send(rectification.geoMask)
+})
 
-      const geotiff = fs.readFileSync(warpedFilename)
+app.post('/json/geotiff', async (req, res) => {
+  const rectification = await json.getRectification(req.body)
 
-      res.writeHead(200, {
-        'Content-Type': 'image/tiff',
-        'Content-disposition': `attachment;filename=${parsed.name}-warped.tiff`,
-        'Content-Length': stats.size
-      })
-      res.end(Buffer.from(geotiff, 'binary'))
-    }
-  })
+  const geotiff = await json.warpImage(req.body, rectification, dataDir)
+  sendTiff(res, geotiff, 'warped.tiff')
 })
 
 app.listen(port, () => console.log(`Georectify service listening on port ${port}!`))
